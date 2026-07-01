@@ -52,15 +52,22 @@ CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);
 The three V1 seed rows are backfilled to `status='SETTLED'`. New trades
 default to `status='PENDING'`.
 
+> **Note:** the backfill sets `updated_at = executed_at` on V1 rows, but
+> new inserts get `updated_at = NOW()` (via the column default and the
+> `crud.create_trade` helper). Legacy rows therefore have
+> `updated_at == executed_at`, while new rows track "last modified"
+> independently. That asymmetry is intentional — we don't want to
+> pretend V1 rows were modified at migration time.
+
 ---
 
 ## How to build
 
 > **Coming from another stage?** Run `docker compose down -v` first to
 > wipe the Postgres volume. Flyway records applied versions in
-> `flyway_schema_history`; if you start step-1 with a database that
-> already has V2/V3 rows, Flyway rejects the mismatch. A clean volume
-> means a clean run.
+> `flyway_schema_history`; if you switch to step-2 with a database that
+> already has V3 rows (or any version this branch doesn't ship), Flyway
+> rejects the mismatch. A clean volume means a clean run.
 
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
