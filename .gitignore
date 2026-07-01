@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# CLAUDE.md is intentionally tracked in this workshop repo (it documents
+# the project). Override the user's global gitignore which excludes it.
+!CLAUDE.md

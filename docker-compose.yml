@@ -1,0 +1,90 @@
+---
+# Docker Compose stack for the Flyway + FastAPI + PostgreSQL teaching example.
+#
+# Services:
+#   postgres  - PostgreSQL 16 with a healthcheck; source of truth for state.
+#   flyway    - One-shot migrator that applies db/migrations/*.sql, then exits.
+#   api       - FastAPI CRUD service; starts only after flyway completes cleanly.
+#
+# Bring the stack up with `docker compose up --build`.
+
+services:
+  postgres:
+    image: "postgres:16-alpine"
+    container_name: "trading-postgres"
+    restart: "unless-stopped"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+      interval: "5s"
+      timeout: "5s"
+      retries: 10
+      start_period: "5s"
+    networks:
+      - "trading-net"
+
+  flyway:
+    image: "flyway/flyway:10-alpine"
+    container_name: "trading-flyway"
+    depends_on:
+      postgres:
+        condition: "service_healthy"
+    environment:
+      FLYWAY_URL: "${FLYWAY_URL}"
+      FLYWAY_USER: "${FLYWAY_USER}"
+      FLYWAY_PASSWORD: "${FLYWAY_PASSWORD}"
+      FLYWAY_CONNECT_RETRIES: "20"
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+      FLYWAY_LOCATIONS: "filesystem:/flyway/sql"
+    command: ["migrate", "info"]
+    volumes:
+      - "./db/migrations:/flyway/sql:ro"
+    networks:
+      - "trading-net"
+
+  api:
+    build:
+      context: "./app"
+      dockerfile: "Dockerfile"
+    container_name: "trading-api"
+    restart: "unless-stopped"
+    depends_on:
+      postgres:
+        condition: "service_healthy"
+      flyway:
+        condition: "service_completed_successfully"
+    environment:
+      DATABASE_URL: "${DATABASE_URL}"
+      API_HOST: "${API_HOST}"
+      API_PORT: "${API_PORT}"
+      LOG_LEVEL: "${LOG_LEVEL}"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c 'import urllib.request,sys; urllib.request.urlopen(\"http://localhost:8000/health\", timeout=2); sys.exit(0)'"
+      interval: "10s"
+      timeout: "5s"
+      retries: 5
+      start_period: "10s"
+    networks:
+      - "trading-net"
+
+volumes:
+  postgres_data:
+    name: "trading_postgres_data"
+
+networks:
+  trading-net:
+    name: "trading-net"
+    driver: "bridge"
