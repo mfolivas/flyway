@@ -126,6 +126,7 @@ def update_trade_endpoint(
 @app.delete(
     "/trades/{trade_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     tags=["trades"],
 )
 def delete_trade_endpoint(
