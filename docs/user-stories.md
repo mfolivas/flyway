@@ -5,7 +5,7 @@ explicit set of acceptance criteria the reader can verify locally.
 
 ---
 
-## US-1: Initial schema startup
+## US-1: Initial schema startup (step-1-v1-only)
 **As a** platform engineer new to Flyway
 **I want** a single command that brings up Postgres and applies the initial
 schema
@@ -13,10 +13,10 @@ schema
 manual steps.
 
 ### Acceptance Criteria
-- Running `docker compose up --build` starts `postgres`, then `flyway`, then
-  `api` in that order.
-- Flyway logs show `Successfully applied 2 migrations` (V1 and V2) on the
-  first run.
+- On branch `step-1-v1-only`, running `docker compose up --build` starts
+  `postgres`, then `flyway`, then `api` in that order.
+- Flyway logs show `Successfully applied 1 migration to schema "public"`
+  on the first run (only V1 exists on this branch).
 - The `flyway_schema_history` table exists in the `trading` database and
   contains one row per applied migration.
 - `GET /health` returns `{"status": "ok", "database": "reachable"}`.

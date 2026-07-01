@@ -22,6 +22,29 @@ Naming rules:
   `enhance_trading_table`, not `alter_table_add_columns`).
 - Do not reuse a version number, even after a failed migration.
 
+## Where Flyway runs
+
+In this workshop Flyway runs as a one-shot Docker Compose service
+alongside the API. That is a **teaching-time convenience only**. In any
+non-toy environment Flyway must be decoupled from the application
+container:
+
+- **Kubernetes / GitOps.** Run Flyway as a `Job` (or an ArgoCD `PreSync`
+  hook / Flux `Kustomization` pre-run) that must complete before the
+  application `Deployment` receives new pod IPs.
+- **Serverless / on-VM apps.** Run Flyway from a CI/CD stage (Azure
+  Pipelines, GitHub Actions) with credentials scoped to schema-owner
+  privileges, gated by the same manual approval that gates the release.
+- **Never** bake a migrator into the same container as the runtime API.
+  That prevents rollbacks, couples deploys to schema changes, and
+  encourages "run it once, hope it works" thinking.
+
+The FastAPI container in this workshop does not embed Flyway — it just
+depends on `flyway.service_completed_successfully`. That pattern
+translates directly to a Kubernetes `initContainer` or an ArgoCD sync
+wave; the compose file is only different in *how* the ordering is
+expressed.
+
 ## How Flyway tracks state
 
 On the first run against an empty database Flyway creates the
@@ -43,6 +66,39 @@ On every subsequent run Flyway:
    drift and it means someone edited a file that has already run somewhere.
 5. Applies pending migrations in strict version order inside a transaction
    per file (Postgres supports transactional DDL).
+
+## Inspecting Flyway state from the CLI
+
+Flyway ships with a first-class status command. Use it in preference to
+poking `flyway_schema_history` directly whenever you just want to know
+"what has run":
+
+```bash
+docker compose run --rm flyway info
+```
+
+Sample output:
+
+```text
++-----------+---------+----------------------------+------+---------------------+---------+
+| Category  | Version | Description                | Type | Installed On        | State   |
++-----------+---------+----------------------------+------+---------------------+---------+
+| Versioned | 1       | initial trading schema     | SQL  | 2026-06-30 20:12:11 | Success |
+| Versioned | 2       | enhance trading table      | SQL  | 2026-06-30 20:12:11 | Success |
+| Versioned | 3       | extract counterparty table | SQL  | 2026-06-30 20:12:11 | Success |
++-----------+---------+----------------------------+------+---------------------+---------+
+```
+
+Other useful one-shot commands:
+
+```bash
+docker compose run --rm flyway validate    # reject if history and files disagree
+docker compose run --rm flyway repair      # clear failed history rows or update checksums
+docker compose run --rm flyway migrate     # apply pending migrations
+```
+
+For SQL-level detail (who ran what, when, checksums, execution time), fall
+back to querying `flyway_schema_history` as shown in the branch READMEs.
 
 ## Adding a new migration
 
