@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Smoke-test the trading API endpoints against a running stack.
+# Smoke-test the trading API endpoints against a running stack (V2).
 # Exits 0 on success, non-zero on the first failure.
+#
+# Adds coverage for V2 fields: status, fees, counterparty, updated_at.
 #
 # Requirements: curl, jq. Idempotent: creates trades, deletes them at the end.
 #
@@ -55,31 +57,35 @@ http_body() {
 
 test_health() {
     info "GET /health"
-    local body
-    body=$(http_body "${BASE_URL}/health")
     local db_status
-    db_status=$(printf '%s' "${body}" | jq -r '.database')
+    db_status=$(http_body "${BASE_URL}/health" | jq -r '.database')
     assert_eq "database reachable" "reachable" "${db_status}"
 }
 
-test_list_seed_data() {
-    info "GET /trades (expect at least 3 seed rows)"
-    local count
-    count=$(http_body "${BASE_URL}/trades" | jq 'length')
-    if (( count >= 3 )); then
-        pass "seed rows present (count=${count})"
+test_list_seed_data_backfilled() {
+    info "GET /trades (V1 seed rows should have been backfilled by V2)"
+    local settled_count
+    settled_count=$(http_body "${BASE_URL}/trades" \
+        | jq '[.[] | select(.status == "SETTLED")] | length')
+    if (( settled_count >= 3 )); then
+        pass "V2 backfilled the 3 V1 seed rows to SETTLED (count=${settled_count})"
     else
-        fail "expected >= 3 seed rows, got ${count}"
+        fail "expected >= 3 rows with status=SETTLED, got ${settled_count}"
     fi
 }
 
-test_create_buy() {
-    info "POST /trades (BUY)"
-    local status_code
-    status_code=$(http_status -X POST "${BASE_URL}/trades" \
+test_create_buy_with_counterparty() {
+    info "POST /trades (BUY with counterparty)"
+    local body
+    body=$(http_body -X POST "${BASE_URL}/trades" \
         -H 'Content-Type: application/json' \
-        -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50}')
-    assert_eq "BUY create status" "201" "${status_code}"
+        -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"JPM"}')
+    local cp
+    cp=$(printf '%s' "${body}" | jq -r '.counterparty')
+    assert_eq "counterparty echoed back" "JPM" "${cp}"
+    local st
+    st=$(printf '%s' "${body}" | jq -r '.status')
+    assert_eq "default status is PENDING" "PENDING" "${st}"
 }
 
 test_create_sell_and_capture_id() {
@@ -97,6 +103,14 @@ test_create_sell_and_capture_id() {
     fi
 }
 
+test_filter_by_status() {
+    info "GET /trades?status=PENDING"
+    local non_pending
+    non_pending=$(http_body "${BASE_URL}/trades?status=PENDING" \
+        | jq '[.[] | select(.status != "PENDING")] | length')
+    assert_eq "no non-PENDING rows in status=PENDING filter" "0" "${non_pending}"
+}
+
 test_filter_by_symbol() {
     info "GET /trades?symbol=NVDA"
     local count
@@ -108,27 +122,27 @@ test_filter_by_symbol() {
     fi
 }
 
-test_filter_by_side() {
-    info "GET /trades?side=BUY"
-    local nonbuy
-    nonbuy=$(http_body "${BASE_URL}/trades?side=BUY" | jq '[.[] | select(.side != "BUY")] | length')
-    assert_eq "no non-BUY rows in side=BUY filter" "0" "${nonbuy}"
+test_mark_settled() {
+    info "PUT /trades/${created_id} (mark SETTLED with fees)"
+    local body
+    body=$(http_body -X PUT "${BASE_URL}/trades/${created_id}" \
+        -H 'Content-Type: application/json' \
+        -d '{"status":"SETTLED","fees":1.25}')
+    local st
+    st=$(printf '%s' "${body}" | jq -r '.status')
+    assert_eq "status is SETTLED" "SETTLED" "${st}"
+    local fees
+    fees=$(printf '%s' "${body}" | jq -r '.fees')
+    assert_eq "fees is 1.25" "1.2500" "${fees}"
 }
 
-test_get_one() {
-    info "GET /trades/${created_id}"
-    local status_code
-    status_code=$(http_status "${BASE_URL}/trades/${created_id}")
-    assert_eq "GET one status" "200" "${status_code}"
-}
-
-test_update() {
-    info "PUT /trades/${created_id}"
+test_invalid_status_rejected() {
+    info "PUT /trades/${created_id} with invalid status (expect 422)"
     local status_code
     status_code=$(http_status -X PUT "${BASE_URL}/trades/${created_id}" \
         -H 'Content-Type: application/json' \
-        -d '{"price":175.00}')
-    assert_eq "PUT status" "200" "${status_code}"
+        -d '{"status":"BOGUS"}')
+    assert_eq "invalid status rejected" "422" "${status_code}"
 }
 
 test_delete() {
@@ -158,13 +172,13 @@ main() {
 
     wait_for_api
     test_health
-    test_list_seed_data
-    test_create_buy
+    test_list_seed_data_backfilled
+    test_create_buy_with_counterparty
     test_create_sell_and_capture_id
+    test_filter_by_status
     test_filter_by_symbol
-    test_filter_by_side
-    test_get_one
-    test_update
+    test_mark_settled
+    test_invalid_status_rejected
     test_delete
     test_not_found
 

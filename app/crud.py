@@ -1,8 +1,13 @@
-"""Data-access helpers for the Trade resource (V1)."""
+"""Data-access helpers for the Trade resource (V2).
+
+V2 adds status/fees/counterparty/updated_at handling. `update_trade` bumps
+`updated_at` on every mutation so callers do not have to.
+"""
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import select
@@ -21,12 +26,20 @@ def create_trade(session: Session, payload: TradeCreate) -> Trade:
         side=payload.side,
         quantity=payload.quantity,
         price=payload.price,
+        status=payload.status,
+        fees=payload.fees,
+        counterparty=payload.counterparty,
+        updated_at=datetime.now(tz=timezone.utc),
     )
     session.add(trade)
     session.commit()
     session.refresh(trade)
     logger.info(
-        "Created trade id=%s symbol=%s side=%s", trade.id, trade.symbol, trade.side
+        "Created trade id=%s symbol=%s side=%s status=%s",
+        trade.id,
+        trade.symbol,
+        trade.side,
+        trade.status,
     )
     return trade
 
@@ -40,6 +53,7 @@ def list_trades(
     session: Session,
     symbol: Optional[str] = None,
     side: Optional[str] = None,
+    status: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ) -> List[Trade]:
@@ -49,6 +63,8 @@ def list_trades(
         statement = statement.where(Trade.symbol == symbol.strip().upper())
     if side is not None:
         statement = statement.where(Trade.side == side.upper())
+    if status is not None:
+        statement = statement.where(Trade.status == status.upper())
 
     statement = statement.order_by(Trade.executed_at.desc()).limit(limit).offset(offset)
     return list(session.scalars(statement).all())
@@ -65,6 +81,7 @@ def update_trade(
     updates = payload.model_dump(exclude_unset=True)
     for field, value in updates.items():
         setattr(trade, field, value)
+    trade.updated_at = datetime.now(tz=timezone.utc)
 
     session.commit()
     session.refresh(trade)

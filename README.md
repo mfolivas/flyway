@@ -1,42 +1,56 @@
-# Step 1 — V1 only: the initial trading schema
+# Step 2 — V2: enhance the trades table
 
-You are on branch **`step-1-v1-only`**. This stage introduces the bare
-minimum: a `trades` table with a handful of columns and three seed rows.
+You are on branch **`step-2-add-v2`**. This stage adds lifecycle metadata
+to the `trades` table without breaking existing data or the API contract.
 
-**What this teaches:** the Flyway baseline. How a single versioned
-migration file, discovered by the Flyway container at boot, creates schema
-and seeds data — and how the FastAPI service comes up against it.
+**What this teaches:** how to add non-nullable columns to a populated
+table safely. The canonical sequence — add nullable → backfill → set
+defaults → tighten to NOT NULL → add constraint — all inside a single
+transactional migration.
 
-**What is NOT here yet:** trade lifecycle (status, fees), counterparties,
-or any V2/V3 concepts. Those arrive on later branches:
+Compare against the previous stage:
 
-| Next branch          | What it adds                                              |
-|----------------------|-----------------------------------------------------------|
-| `step-2-add-v2`      | `status`, `fees`, `counterparty`, `updated_at`, indexes.  |
-| `step-3-add-v3`      | Normalize `counterparties` into their own table.         |
+```bash
+git diff step-1-v1-only step-2-add-v2 -- db/ app/
+```
+
+You will see:
+
+- One new migration file: `db/migrations/V2__enhance_trading_table.sql`.
+- ORM model gains four columns.
+- API contract gains `status`, `fees`, `counterparty`, `updated_at`.
+- New query param: `GET /trades?status=SETTLED`.
+- `PUT /trades/{id}` can now mark a trade `SETTLED`.
 
 ---
 
-## What V1 gives you
+## What V2 changes
 
 ```sql
-CREATE TABLE trades (
-    id           BIGSERIAL PRIMARY KEY,
-    symbol       VARCHAR(16)    NOT NULL,
-    side         VARCHAR(4)     NOT NULL,   -- BUY or SELL
-    quantity     NUMERIC(20, 4) NOT NULL,
-    price        NUMERIC(20, 4) NOT NULL,
-    executed_at  TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_trades_side           CHECK (side IN ('BUY','SELL')),
-    CONSTRAINT chk_trades_quantity_positive CHECK (quantity > 0),
-    CONSTRAINT chk_trades_price_positive    CHECK (price > 0)
-);
+ALTER TABLE trades
+    ADD COLUMN IF NOT EXISTS status       VARCHAR(16),
+    ADD COLUMN IF NOT EXISTS fees         NUMERIC(20, 4),
+    ADD COLUMN IF NOT EXISTS counterparty VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ;
+
+UPDATE trades
+   SET status='SETTLED', fees=0, updated_at=executed_at
+ WHERE status IS NULL;
+
+ALTER TABLE trades
+    ALTER COLUMN status     SET DEFAULT 'PENDING', ALTER COLUMN status     SET NOT NULL,
+    ALTER COLUMN fees       SET DEFAULT 0,         ALTER COLUMN fees       SET NOT NULL,
+    ALTER COLUMN updated_at SET DEFAULT NOW(),     ALTER COLUMN updated_at SET NOT NULL;
+
+ALTER TABLE trades
+    ADD CONSTRAINT chk_trades_status CHECK (status IN ('PENDING','SETTLED','CANCELLED'));
+
+CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades (symbol);
+CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);
 ```
 
-Plus three seed rows: an AAPL BUY, an MSFT BUY, an AAPL SELL.
-
-The FastAPI app on this branch mirrors that schema exactly — no extra
-fields in the API contract.
+The three V1 seed rows are backfilled to `status='SETTLED'`. New trades
+default to `status='PENDING'`.
 
 ---
 
@@ -50,8 +64,8 @@ fields in the API contract.
 
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
-cp .env.example .env         # one-time setup
-docker compose build         # build the API image
+cp .env.example .env         # if you haven't already
+docker compose build         # rebuild the API image for the V2 code
 ```
 
 ## How to start
@@ -59,18 +73,16 @@ docker compose build         # build the API image
 ```bash
 docker compose up            # foreground; Ctrl+C to stop
 # or
-docker compose up -d         # detached
-docker compose logs -f api   # follow API logs
+docker compose up -d
+docker compose logs -f flyway
+docker compose logs -f api
 ```
 
-On success you will see, in order:
+On success, Flyway logs show:
 
-- `trading-postgres  ... database system is ready to accept connections`
-- `trading-flyway    ... Successfully applied 1 migration to schema "public"`
-- `trading-flyway exited with code 0`
-- `trading-api       ... Uvicorn running on http://0.0.0.0:8000`
-
-If Flyway fails, `api` never starts. That is by design.
+```text
+Successfully applied 2 migrations to schema "public"
+```
 
 ## How to test
 
@@ -78,38 +90,26 @@ If Flyway fails, `api` never starts. That is by design.
 bash scripts/test_endpoints.sh
 ```
 
-Or exercise endpoints manually:
+The V2 test script exercises the new fields, verifies V1 seed data was
+backfilled, and rejects invalid `status` values.
+
+Manual examples:
 
 ```bash
-# Health
-curl -s http://localhost:8000/health | jq .
+# List trades filtered by status
+curl -s 'http://localhost:8000/trades?status=SETTLED' | jq .
+curl -s 'http://localhost:8000/trades?status=PENDING' | jq .
 
-# List seed rows
-curl -s http://localhost:8000/trades | jq .
-
-# Create a BUY
+# Create with counterparty
 curl -s -X POST http://localhost:8000/trades \
   -H 'Content-Type: application/json' \
-  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50}' | jq .
+  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"JPM"}' | jq .
 
-# Filter
-curl -s 'http://localhost:8000/trades?symbol=AAPL' | jq .
-curl -s 'http://localhost:8000/trades?side=BUY'    | jq .
-
-# Get one
-curl -s http://localhost:8000/trades/1 | jq .
-
-# Update
-curl -s -X PUT http://localhost:8000/trades/1 \
+# Mark a trade SETTLED
+curl -s -X PUT http://localhost:8000/trades/4 \
   -H 'Content-Type: application/json' \
-  -d '{"price":195.00}' | jq .
-
-# Delete
-curl -s -X DELETE -o /dev/null -w '%{http_code}\n' http://localhost:8000/trades/1
+  -d '{"status":"SETTLED","fees":1.25}' | jq .
 ```
-
-Interactive OpenAPI docs live at
-[http://localhost:8000/docs](http://localhost:8000/docs).
 
 ## How to inspect Flyway state
 
@@ -119,39 +119,38 @@ docker compose exec postgres psql -U trading_user -d trading \
       FROM flyway_schema_history;'
 ```
 
-Expected after boot:
+Expected:
 
 ```text
  installed_rank | version | description            | success
 ----------------+---------+------------------------+---------
               1 | 1       | initial trading schema | t
+              2 | 2       | enhance trading table  | t
 ```
 
-## How to move to step 2
+## How to move to step 3
 
 ```bash
-docker compose down -v       # wipe Postgres volume
-git checkout step-2-add-v2
+docker compose down -v
+git checkout step-3-add-v3
 docker compose up --build
 ```
 
-See what step 2 changes before you jump:
+Preview the diff:
 
 ```bash
-git diff step-1-v1-only step-2-add-v2 -- db/ app/
+git diff step-2-add-v2 step-3-add-v3 -- db/ app/
 ```
 
 ## Troubleshooting
 
-**Flyway container exits with `Migration checksum mismatch`**
-Someone edited `V1__initial_trading_schema.sql` after it had already been
-applied. Revert the edit, or run `docker compose run --rm flyway repair`.
+**`ERROR: check constraint "chk_trades_status" is violated by some row`**
+V1 rows were not backfilled before the constraint was added. In this
+example the migration does the backfill in the same transaction so this
+should not happen; if you see it, inspect the migration for a bad SQL edit
+that skipped the `UPDATE`.
+
+**`Migration checksum mismatch`**
+Someone edited `V1__` or `V2__` after it had been applied. Revert the
+edit or run `docker compose run --rm flyway repair`.
 See [`docs/migration-strategy.md`](docs/migration-strategy.md).
-
-**Port already in use**
-Another process holds `5432` or `8000`. Stop it or remap the port in
-`docker-compose.yml`.
-
-**API restart loop with `database "trading" does not exist`**
-Postgres finished initializing after Flyway timed out. Bring down with
-`docker compose down -v` and back up.

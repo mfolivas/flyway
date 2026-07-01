@@ -1,7 +1,7 @@
-"""FastAPI entrypoint for the trading service (V1).
+"""FastAPI entrypoint for the trading service (V2).
 
-The service assumes Flyway has already applied V1 before the API process
-starts. The docker-compose file enforces that with
+The service assumes Flyway has already applied V1 and V2 before the API
+process starts. The docker-compose file enforces that with
 `depends_on: flyway: condition: service_completed_successfully`.
 """
 
@@ -28,10 +28,10 @@ logger = logging.getLogger("trading-api")
 
 app = FastAPI(
     title="Trading Service",
-    version="1.0.0",
+    version="2.0.0",
     description=(
-        "Teaching example (step 1 / V1): a FastAPI CRUD trading service "
-        "backed by PostgreSQL, with Flyway managing schema migrations."
+        "Teaching example (step 2 / V2): trades now carry status, fees, "
+        "counterparty, and updated_at."
     ),
 )
 
@@ -66,6 +66,11 @@ def create_trade_endpoint(
 def list_trades_endpoint(
     symbol: Optional[str] = Query(default=None, description="Filter by ticker symbol"),
     side: Optional[str] = Query(default=None, description="Filter by BUY or SELL"),
+    status_filter: Optional[str] = Query(
+        default=None,
+        alias="status",
+        description="Filter by PENDING, SETTLED, or CANCELLED",
+    ),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_db),
@@ -75,6 +80,7 @@ def list_trades_endpoint(
         session=session,
         symbol=symbol,
         side=side,
+        status=status_filter,
         limit=limit,
         offset=offset,
     )
@@ -101,7 +107,7 @@ def update_trade_endpoint(
     payload: TradeUpdate,
     session: Session = Depends(get_db),
 ) -> TradeRead:
-    """Apply a partial update to a trade."""
+    """Apply a partial update (for example, marking a trade SETTLED)."""
     trade = crud.update_trade(session, trade_id, payload)
     if trade is None:
         raise HTTPException(
