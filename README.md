@@ -42,6 +42,12 @@ fields in the API contract.
 
 ## How to build
 
+> **Coming from another stage?** Run `docker compose down -v` first to
+> wipe the Postgres volume. Flyway records applied versions in
+> `flyway_schema_history`; if you start step-1 with a database that
+> already has V2/V3 rows, Flyway rejects the mismatch. A clean volume
+> means a clean run.
+
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
 cp .env.example .env         # one-time setup
