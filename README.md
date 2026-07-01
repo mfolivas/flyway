@@ -1,178 +1,151 @@
-# Trading Service — Flyway Migration Workshop
+# Step 1 — V1 only: the initial trading schema
 
-A teaching artifact for platform engineers. It walks through the evolution
-of a small trading service's PostgreSQL schema using **Flyway**, one step
-per git branch, so you can see the schema and the FastAPI application code
-grow together across three versions.
+You are on branch **`step-1-v1-only`**. This stage introduces the bare
+minimum: a `trades` table with a handful of columns and three seed rows.
 
-Use case: a trading service that records buy/sell transactions for
-securities. We start with the smallest possible schema and evolve it into
-something more realistic.
+**What this teaches:** the Flyway baseline. How a single versioned
+migration file, discovered by the Flyway container at boot, creates schema
+and seeds data — and how the FastAPI service comes up against it.
+
+**What is NOT here yet:** trade lifecycle (status, fees), counterparties,
+or any V2/V3 concepts. Those arrive on later branches:
+
+| Next branch          | What it adds                                              |
+|----------------------|-----------------------------------------------------------|
+| `step-2-add-v2`      | `status`, `fees`, `counterparty`, `updated_at`, indexes.  |
+| `step-3-add-v3`      | Normalize `counterparties` into their own table.         |
 
 ---
 
-## How the workshop is structured
+## What V1 gives you
 
-Each stage of the schema lives on its own branch:
+```sql
+CREATE TABLE trades (
+    id           BIGSERIAL PRIMARY KEY,
+    symbol       VARCHAR(16)    NOT NULL,
+    side         VARCHAR(4)     NOT NULL,   -- BUY or SELL
+    quantity     NUMERIC(20, 4) NOT NULL,
+    price        NUMERIC(20, 4) NOT NULL,
+    executed_at  TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_trades_side           CHECK (side IN ('BUY','SELL')),
+    CONSTRAINT chk_trades_quantity_positive CHECK (quantity > 0),
+    CONSTRAINT chk_trades_price_positive    CHECK (price > 0)
+);
+```
 
-| Branch                | Migrations | What it teaches                                                                 |
-|-----------------------|------------|---------------------------------------------------------------------------------|
-| `main` *(this one)*   | none       | Workshop overview. Nothing to run here.                                         |
-| `step-1-v1-only`      | V1         | Bare-minimum trades table. Flyway baseline + first `INSERT`s.                   |
-| `step-2-add-v2`       | V1, V2     | Adding columns to a populated table safely: nullable → backfill → NOT NULL.     |
-| `step-3-add-v3`       | V1, V2, V3 | Expand-contract normalization: extract counterparty into its own table.        |
+Plus three seed rows: an AAPL BUY, an MSFT BUY, an AAPL SELL.
 
-The application code (`app/`) evolves with the schema. Every branch has
-just the code, endpoints, and test cases that match its schema level.
+The FastAPI app on this branch mirrors that schema exactly — no extra
+fields in the API contract.
 
-## Getting started
+---
 
-### Prerequisites
-
-- Docker Desktop 4.x or Docker Engine 24+ with the Compose plugin
-- Ports `5432` (Postgres) and `8000` (API) free on the host
-- ~500 MB free disk
-
-Python, Flyway, and the JDBC driver all run inside containers — nothing
-else needs to be installed on the host.
-
-### One-time setup
+## How to build
 
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
-cp .env.example .env
+cp .env.example .env         # one-time setup
+docker compose build         # build the API image
 ```
 
-`.env` holds local-only defaults (see `.env.example`). It is `.gitignore`d.
-
-### Pick a stage
+## How to start
 
 ```bash
-git branch -a                       # list branches
-git checkout step-1-v1-only         # start with V1
+docker compose up            # foreground; Ctrl+C to stop
+# or
+docker compose up -d         # detached
+docker compose logs -f api   # follow API logs
 ```
 
-There is nothing to run on `main` — it holds the workshop guide only. Every
-stage lives on its own branch.
+On success you will see, in order:
 
-### Build
+- `trading-postgres  ... database system is ready to accept connections`
+- `trading-flyway    ... Successfully applied 1 migration to schema "public"`
+- `trading-flyway exited with code 0`
+- `trading-api       ... Uvicorn running on http://0.0.0.0:8000`
 
-```bash
-docker compose build
-```
+If Flyway fails, `api` never starts. That is by design.
 
-Builds the `api` image. Fast on second run thanks to layer caching.
-
-### Start
-
-```bash
-docker compose up
-```
-
-Runs `postgres`, then `flyway` (applies pending migrations, exits `0`),
-then `api`. `Ctrl+C` to stop.
-
-Prefer detached mode plus logs:
-
-```bash
-docker compose up -d
-docker compose logs -f flyway     # watch migrations apply
-docker compose logs -f api        # watch the API come up
-```
-
-The API is at [http://localhost:8000](http://localhost:8000).
-Interactive docs at [http://localhost:8000/docs](http://localhost:8000/docs).
-
-### Smoke test
+## How to test
 
 ```bash
 bash scripts/test_endpoints.sh
 ```
 
-Exits `0` on success, non-zero on failure. Idempotent.
-
-### Move to the next stage
+Or exercise endpoints manually:
 
 ```bash
-docker compose down -v            # stop and wipe the Postgres volume
-git checkout step-2-add-v2        # or step-3-add-v3
-docker compose up --build         # rebuild for the new stage
+# Health
+curl -s http://localhost:8000/health | jq .
+
+# List seed rows
+curl -s http://localhost:8000/trades | jq .
+
+# Create a BUY
+curl -s -X POST http://localhost:8000/trades \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50}' | jq .
+
+# Filter
+curl -s 'http://localhost:8000/trades?symbol=AAPL' | jq .
+curl -s 'http://localhost:8000/trades?side=BUY'    | jq .
+
+# Get one
+curl -s http://localhost:8000/trades/1 | jq .
+
+# Update
+curl -s -X PUT http://localhost:8000/trades/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"price":195.00}' | jq .
+
+# Delete
+curl -s -X DELETE -o /dev/null -w '%{http_code}\n' http://localhost:8000/trades/1
 ```
 
-### See what changed between stages
+Interactive OpenAPI docs live at
+[http://localhost:8000/docs](http://localhost:8000/docs).
+
+## How to inspect Flyway state
+
+```bash
+docker compose exec postgres psql -U trading_user -d trading \
+  -c 'SELECT installed_rank, version, description, success
+      FROM flyway_schema_history;'
+```
+
+Expected after boot:
+
+```text
+ installed_rank | version | description            | success
+----------------+---------+------------------------+---------
+              1 | 1       | initial trading schema | t
+```
+
+## How to move to step 2
+
+```bash
+docker compose down -v       # wipe Postgres volume
+git checkout step-2-add-v2
+docker compose up --build
+```
+
+See what step 2 changes before you jump:
 
 ```bash
 git diff step-1-v1-only step-2-add-v2 -- db/ app/
-git diff step-2-add-v2 step-3-add-v3 -- db/ app/
 ```
 
-## Architecture (same on every branch)
+## Troubleshooting
 
-```mermaid
-flowchart LR
-    Dev[Developer] -->|docker compose up| Compose[Docker Compose]
-    Compose --> PG[(PostgreSQL 16)]
-    Compose --> FW[Flyway Migrator]
-    Compose --> API[FastAPI Service]
-    FW -->|applies V1 .. VN| PG
-    API -->|CRUD queries| PG
-    Client[HTTP Client] -->|REST| API
-```
+**Flyway container exits with `Migration checksum mismatch`**
+Someone edited `V1__initial_trading_schema.sql` after it had already been
+applied. Revert the edit, or run `docker compose run --rm flyway repair`.
+See [`docs/migration-strategy.md`](docs/migration-strategy.md).
 
-Startup ordering is enforced by `depends_on`:
+**Port already in use**
+Another process holds `5432` or `8000`. Stop it or remap the port in
+`docker-compose.yml`.
 
-1. `postgres` becomes healthy.
-2. `flyway` runs, applies pending migrations, exits `0`.
-3. `api` starts and serves on port `8000`.
-
-If Flyway fails, `api` never starts — you cannot serve traffic against a
-broken schema.
-
-## Prerequisites
-
-- Docker Desktop 4.x or Docker Engine 24+ with the Compose plugin
-- Ports `5432` (Postgres) and `8000` (API) free on the host
-- About 500 MB of free disk
-
-Python, Flyway, and the JDBC driver all run inside containers. Nothing else
-needs to be installed locally.
-
-## Repository layout
-
-Files present on `main`:
-
-```text
-example/
-├── README.md              # this file
-├── CLAUDE.md              # project-scoped guidance for Claude Code sessions
-├── docker-compose.yml     # postgres + flyway + api services
-├── .env.example           # copy to .env before boot
-├── .gitignore
-└── docs/
-    ├── product-brief.md
-    ├── user-stories.md
-    └── migration-strategy.md
-```
-
-Files added on each step branch:
-
-```text
-example/
-├── app/                   # FastAPI service (Dockerfile, requirements, source)
-├── db/migrations/         # Flyway SQL (V1__..., V2__..., V3__...)
-└── scripts/
-    └── test_endpoints.sh  # smoke tests against the running stack
-```
-
-## Where to go next
-
-- New to Flyway? Read [`docs/migration-strategy.md`](docs/migration-strategy.md)
-  first — it covers versioning, the `flyway_schema_history` table, checksum
-  drift, and the expand-contract pattern used in step 3.
-- Working on this project with Claude Code? See
-  [`CLAUDE.md`](CLAUDE.md) for coding standards, common commands, and the
-  guardrails specific to this repo.
-- Product context (problem, users, success criteria) lives in
-  [`docs/product-brief.md`](docs/product-brief.md).
-- User stories covering each stage are in
-  [`docs/user-stories.md`](docs/user-stories.md).
+**API restart loop with `database "trading" does not exist`**
+Postgres finished initializing after Flyway timed out. Bring down with
+`docker compose down -v` and back up.
