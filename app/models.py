@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Optional
+from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -21,7 +21,7 @@ from sqlalchemy import (
     String,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
 
@@ -36,8 +36,6 @@ class Counterparty(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-
-    trades: Mapped[List["Trade"]] = relationship(back_populates="counterparty_ref")
 
 
 class Trade(Base):
@@ -67,11 +65,11 @@ class Trade(Base):
 
     # V3: nullable foreign key. Populated on create when a counterparty name
     # is supplied. The old string column above is kept in place for expand.
+    # An SQLAlchemy relationship on this FK is intentionally omitted -
+    # nothing in the API surface reads the joined Counterparty object, so
+    # a relationship would only add overhead and confuse the reader.
     counterparty_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("counterparties.id"), nullable=True
-    )
-    counterparty_ref: Mapped[Optional["Counterparty"]] = relationship(
-        back_populates="trades", lazy="selectin"
     )
 
     __table_args__ = (

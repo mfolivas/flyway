@@ -35,9 +35,14 @@ FROM trades
 WHERE counterparty IS NOT NULL
 ON CONFLICT (name) DO NOTHING;
 
+-- ON DELETE RESTRICT is explicit and matches Postgres's default (NO ACTION
+-- with the same effect for our use), but stating it here documents intent:
+-- deleting a counterparty that still has trades attached must be an error,
+-- not a silent cascade. If a future ADR calls for cleaner deletes, change
+-- to ON DELETE SET NULL in a new migration.
 ALTER TABLE trades
     ADD COLUMN IF NOT EXISTS counterparty_id BIGINT
-    REFERENCES counterparties (id);
+    REFERENCES counterparties (id) ON DELETE RESTRICT;
 
 -- Link existing trades to the newly-created counterparties rows.
 UPDATE trades t

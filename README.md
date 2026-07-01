@@ -78,10 +78,9 @@ Application code changes:
 ## How to build
 
 > **Coming from another stage?** Run `docker compose down -v` first to
-> wipe the Postgres volume. Flyway records applied versions in
-> `flyway_schema_history`; if you switch to step-2 with a database that
-> already has V3 rows (or any version this branch doesn't ship), Flyway
-> rejects the mismatch. A clean volume means a clean run.
+> wipe the Postgres volume. If the volume was populated by an earlier
+> step, the `flyway_schema_history` rows may not match this branch's
+> migration files exactly — a clean volume avoids any drift confusion.
 
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
@@ -168,6 +167,40 @@ docker compose exec postgres psql -U trading_user -d trading -c '
      ORDER BY t.id;'
 ```
 
+## Exercise — trigger and repair checksum drift
+
+Flyway's checksum enforcement is the guardrail against "someone edited a
+migration after it ran." Try breaking it on purpose:
+
+```bash
+# Bring the stack up and let all three migrations apply.
+docker compose up -d
+docker compose run --rm flyway info    # Success on V1, V2, V3.
+
+# Edit V1 in a harmless way (add a blank line at the end).
+printf '\n' >> db/migrations/V1__initial_trading_schema.sql
+
+# Re-run migrate. Flyway refuses.
+docker compose run --rm flyway migrate
+#   ERROR: Migration checksum mismatch for migration version 1
+#   -> Applied to database : ...
+#   -> Resolved locally    : ...
+
+# You have two ways out. Pick one:
+
+# (a) Revert the edit and try again.
+git checkout -- db/migrations/V1__initial_trading_schema.sql
+docker compose run --rm flyway migrate    # succeeds.
+
+# (b) If the edit was intentional (e.g. a comment cleanup), tell Flyway
+#     to accept the new checksum:
+docker compose run --rm flyway repair
+docker compose run --rm flyway info       # V1 shows the updated checksum.
+```
+
+Never resolve drift by hand-editing `flyway_schema_history`. `repair` is
+the sanctioned tool.
+
 ## Where to go from here
 
 You have finished the workshop.
@@ -177,6 +210,9 @@ You have finished the workshop.
 - Read [`docs/migration-strategy.md`](docs/migration-strategy.md) for the
   full write-up on Flyway state, checksum drift, failure handling, and
   the expand-contract pattern.
+- Read [`docs/decisions/ADR-001-adopt-flyway.md`](docs/decisions/ADR-001-adopt-flyway.md)
+  for the rationale behind choosing Flyway over Liquibase, Alembic, and
+  Sqitch.
 - Try adding a `V4__drop_trades_counterparty_column.sql` yourself as an
   exercise. Remember: forward-only. If you break it, `flyway repair`
   clears the failed row from history.

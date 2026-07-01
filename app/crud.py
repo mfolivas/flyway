@@ -118,6 +118,12 @@ def update_trade(
         return None
 
     updates = payload.model_dump(exclude_unset=True)
+
+    # Resolve counterparty_id from the string first (get-or-create), then
+    # apply the rest of the payload. The setattr loop below writes the
+    # string column but does not touch counterparty_id (it is not in the
+    # payload), so the order is safe. Doing the FK resolution first also
+    # means a bad counterparty raises before we mutate anything else.
     if "counterparty" in updates:
         cp_name = updates["counterparty"]
         if cp_name is None or not cp_name.strip():
