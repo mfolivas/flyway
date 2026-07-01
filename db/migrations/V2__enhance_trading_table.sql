@@ -12,6 +12,18 @@
 --
 -- Finally, backfills existing V1 rows so seed data is queryable under the
 -- new contract without any application-side handling.
+--
+-- PROD CAVEATS - this migration runs in a single Postgres transaction, so
+-- ALTER TABLE ... SET NOT NULL takes an ACCESS EXCLUSIVE lock on `trades`
+-- for the whole duration. On a large table this blocks reads and writes.
+-- A production version of this migration would:
+--   1. Split the CREATE INDEX statements into their own migrations and
+--      use CREATE INDEX CONCURRENTLY outside a transaction.
+--   2. Add the check constraint as NOT VALID first, then VALIDATE
+--      CONSTRAINT in a separate migration once existing rows have been
+--      backfilled. This shortens the lock window.
+-- For a teaching workshop against a three-row table those niceties would
+-- obscure the pattern, so we keep everything in one file.
 
 ALTER TABLE trades
     ADD COLUMN IF NOT EXISTS status       VARCHAR(16),
