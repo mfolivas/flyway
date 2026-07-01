@@ -39,7 +39,7 @@ else needs to be installed on the host.
 ### One-time setup
 
 ```bash
-cd ~/Documents/analysis/stories/database-migration/example
+cd flyway         # wherever you cloned this repo
 cp .env.example .env
 ```
 
@@ -128,21 +128,12 @@ Startup ordering is enforced by `depends_on`:
 If Flyway fails, `api` never starts — you cannot serve traffic against a
 broken schema.
 
-## Prerequisites
-
-- Docker Desktop 4.x or Docker Engine 24+ with the Compose plugin
-- Ports `5432` (Postgres) and `8000` (API) free on the host
-- About 500 MB of free disk
-
-Python, Flyway, and the JDBC driver all run inside containers. Nothing else
-needs to be installed locally.
-
 ## Repository layout
 
 Files present on `main`:
 
 ```text
-example/
+flyway/
 ├── README.md              # this file
 ├── CLAUDE.md              # project-scoped guidance for Claude Code sessions
 ├── docker-compose.yml     # postgres + flyway + api services
@@ -157,7 +148,7 @@ example/
 Files added on each step branch:
 
 ```text
-example/
+flyway/
 ├── app/                   # FastAPI service (Dockerfile, requirements, source)
 ├── db/migrations/         # Flyway SQL (V1__..., V2__..., V3__...)
 └── scripts/
