@@ -1,56 +1,70 @@
-# Step 2 — V2: enhance the trades table
+# Step 3 — V3: normalize counterparties (expand-contract)
 
-You are on branch **`step-2-add-v2`**. This stage adds lifecycle metadata
-to the `trades` table without breaking existing data or the API contract.
+You are on branch **`step-3-add-v3`**. This stage extracts the
+`counterparty` free-text column into its own `counterparties` table with a
+proper foreign key, using the **expand-contract pattern** so no running
+consumer breaks.
 
-**What this teaches:** how to add non-nullable columns to a populated
-table safely. The canonical sequence — add nullable → backfill → set
-defaults → tighten to NOT NULL → add constraint — all inside a single
-transactional migration.
+**What this teaches:**
+1. Expand-contract for zero-downtime schema changes:
+   - **Expand (this migration):** add the new structure, backfill, keep
+     the old column in place so old code still works.
+   - **Deploy code** that writes to both and reads from the new structure.
+   - **Contract (a future V4):** drop the old column once no code touches
+     it.
+2. Backfill logic inside a migration: `INSERT ... SELECT DISTINCT` plus a
+   correlated `UPDATE ... FROM`.
+3. Get-or-create semantics in the application layer so repeated
+   counterparty names collapse to a single row.
 
 Compare against the previous stage:
 
 ```bash
-git diff step-1-v1-only step-2-add-v2 -- db/ app/
+git diff step-2-add-v2 step-3-add-v3 -- db/ app/
 ```
-
-You will see:
-
-- One new migration file: `db/migrations/V2__enhance_trading_table.sql`.
-- ORM model gains four columns.
-- API contract gains `status`, `fees`, `counterparty`, `updated_at`.
-- New query param: `GET /trades?status=SETTLED`.
-- `PUT /trades/{id}` can now mark a trade `SETTLED`.
 
 ---
 
-## What V2 changes
+## What V3 changes
 
 ```sql
-ALTER TABLE trades
-    ADD COLUMN IF NOT EXISTS status       VARCHAR(16),
-    ADD COLUMN IF NOT EXISTS fees         NUMERIC(20, 4),
-    ADD COLUMN IF NOT EXISTS counterparty VARCHAR(64),
-    ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ;
+CREATE TABLE counterparties (
+    id         BIGSERIAL PRIMARY KEY,
+    name       VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_counterparties_name UNIQUE (name)
+);
 
-UPDATE trades
-   SET status='SETTLED', fees=0, updated_at=executed_at
- WHERE status IS NULL;
-
-ALTER TABLE trades
-    ALTER COLUMN status     SET DEFAULT 'PENDING', ALTER COLUMN status     SET NOT NULL,
-    ALTER COLUMN fees       SET DEFAULT 0,         ALTER COLUMN fees       SET NOT NULL,
-    ALTER COLUMN updated_at SET DEFAULT NOW(),     ALTER COLUMN updated_at SET NOT NULL;
+INSERT INTO counterparties (name)
+SELECT DISTINCT counterparty
+FROM trades
+WHERE counterparty IS NOT NULL
+ON CONFLICT (name) DO NOTHING;
 
 ALTER TABLE trades
-    ADD CONSTRAINT chk_trades_status CHECK (status IN ('PENDING','SETTLED','CANCELLED'));
+    ADD COLUMN IF NOT EXISTS counterparty_id BIGINT
+    REFERENCES counterparties (id);
 
-CREATE INDEX IF NOT EXISTS ix_trades_symbol ON trades (symbol);
-CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);
+UPDATE trades t
+   SET counterparty_id = c.id
+  FROM counterparties c
+ WHERE t.counterparty = c.name
+   AND t.counterparty_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS ix_trades_counterparty_id ON trades (counterparty_id);
 ```
 
-The three V1 seed rows are backfilled to `status='SETTLED'`. New trades
-default to `status='PENDING'`.
+**Note the old `trades.counterparty` column is intentionally preserved.**
+A hypothetical `V4__drop_trades_counterparty_column.sql` would remove it
+once every consumer reads from `counterparty_id`.
+
+Application code changes:
+
+- New ORM model: `Counterparty`.
+- `Trade.counterparty_id` FK with a lazy relationship.
+- `create_trade` writes BOTH the old string column AND the FK.
+- New endpoint: `GET /counterparties`.
+- `TradeRead` response now includes `counterparty_id`.
 
 > **Note:** the backfill sets `updated_at = executed_at` on V1 rows, but
 > new inserts get `updated_at = NOW()` (via the column default and the
@@ -72,7 +86,7 @@ default to `status='PENDING'`.
 ```bash
 cd ~/Documents/analysis/stories/database-migration/example
 cp .env.example .env         # if you haven't already
-docker compose build         # rebuild the API image for the V2 code
+docker compose build         # rebuild the API image for V3 code
 ```
 
 ## How to start
@@ -85,10 +99,10 @@ docker compose logs -f flyway
 docker compose logs -f api
 ```
 
-On success, Flyway logs show:
+On success Flyway logs show:
 
 ```text
-Successfully applied 2 migrations to schema "public"
+Successfully applied 3 migrations to schema "public"
 ```
 
 ## How to test
@@ -97,25 +111,33 @@ Successfully applied 2 migrations to schema "public"
 bash scripts/test_endpoints.sh
 ```
 
-The V2 test script exercises the new fields, verifies V1 seed data was
-backfilled, and rejects invalid `status` values.
+The V3 test script verifies:
+
+- `GET /counterparties` is reachable and returns a list.
+- Posting a trade with `counterparty="JPM"` creates a `counterparties`
+  row and populates `trades.counterparty_id`.
+- A second trade with the same counterparty **reuses** the existing row
+  (no duplicate).
+- Trades without a counterparty leave `counterparty_id` null.
 
 Manual examples:
 
 ```bash
-# List trades filtered by status
-curl -s 'http://localhost:8000/trades?status=SETTLED' | jq .
-curl -s 'http://localhost:8000/trades?status=PENDING' | jq .
+# Fresh DB: no counterparties yet
+curl -s http://localhost:8000/counterparties | jq .
 
-# Create with counterparty
+# Post a trade with a counterparty
 curl -s -X POST http://localhost:8000/trades \
   -H 'Content-Type: application/json' \
-  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"JPM"}' | jq .
+  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"Goldman"}' | jq .
 
-# Mark a trade SETTLED
-curl -s -X PUT http://localhost:8000/trades/4 \
+# Counterparties list now contains Goldman
+curl -s http://localhost:8000/counterparties | jq .
+
+# Second trade with the same counterparty reuses the row
+curl -s -X POST http://localhost:8000/trades \
   -H 'Content-Type: application/json' \
-  -d '{"status":"SETTLED","fees":1.25}' | jq .
+  -d '{"symbol":"AMD","side":"SELL","quantity":5,"price":170.25,"counterparty":"Goldman"}' | jq .
 ```
 
 ## How to inspect Flyway state
@@ -129,35 +151,49 @@ docker compose exec postgres psql -U trading_user -d trading \
 Expected:
 
 ```text
- installed_rank | version | description            | success
-----------------+---------+------------------------+---------
-              1 | 1       | initial trading schema | t
-              2 | 2       | enhance trading table  | t
+ installed_rank | version | description                | success
+----------------+---------+----------------------------+---------
+              1 | 1       | initial trading schema     | t
+              2 | 2       | enhance trading table      | t
+              3 | 3       | extract counterparty table | t
 ```
 
-## How to move to step 3
+Inspect the joined data:
 
 ```bash
-docker compose down -v
-git checkout step-3-add-v3
-docker compose up --build
+docker compose exec postgres psql -U trading_user -d trading -c '
+    SELECT t.id, t.symbol, t.side, t.counterparty, c.name AS cp_name, c.id AS cp_id
+      FROM trades t
+      LEFT JOIN counterparties c ON c.id = t.counterparty_id
+     ORDER BY t.id;'
 ```
 
-Preview the diff:
+## Where to go from here
 
-```bash
-git diff step-2-add-v2 step-3-add-v3 -- db/ app/
-```
+You have finished the workshop.
+
+- Review the full arc:
+  `git diff main step-3-add-v3 -- db/ app/`
+- Read [`docs/migration-strategy.md`](docs/migration-strategy.md) for the
+  full write-up on Flyway state, checksum drift, failure handling, and
+  the expand-contract pattern.
+- Try adding a `V4__drop_trades_counterparty_column.sql` yourself as an
+  exercise. Remember: forward-only. If you break it, `flyway repair`
+  clears the failed row from history.
 
 ## Troubleshooting
 
-**`ERROR: check constraint "chk_trades_status" is violated by some row`**
-V1 rows were not backfilled before the constraint was added. In this
-example the migration does the backfill in the same transaction so this
-should not happen; if you see it, inspect the migration for a bad SQL edit
-that skipped the `UPDATE`.
+**`FOREIGN KEY constraint violated on counterparty_id`**
+Something wrote to `trades.counterparty_id` with an id that does not
+exist in `counterparties`. In this example that should not happen — the
+app resolves counterparties through `get_or_create_counterparty`. Check
+`crud.py` for a recent edit that bypassed it.
+
+**Duplicate counterparty rows appearing**
+The `uq_counterparties_name` constraint would prevent that at the DB
+layer. If they appear, the application code path is bypassing
+`get_or_create_counterparty` — inspect `crud.py`.
 
 **`Migration checksum mismatch`**
-Someone edited `V1__` or `V2__` after it had been applied. Revert the
-edit or run `docker compose run --rm flyway repair`.
-See [`docs/migration-strategy.md`](docs/migration-strategy.md).
+Someone edited `V1__`, `V2__`, or `V3__` after it was applied. Revert or
+`docker compose run --rm flyway repair`.

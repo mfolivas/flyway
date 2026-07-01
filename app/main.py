@@ -1,8 +1,8 @@
-"""FastAPI entrypoint for the trading service (V2).
+"""FastAPI entrypoint for the trading service (V3).
 
-The service assumes Flyway has already applied V1 and V2 before the API
-process starts. The docker-compose file enforces that with
-`depends_on: flyway: condition: service_completed_successfully`.
+The service assumes Flyway has already applied V1, V2, and V3 before the
+API process starts. `depends_on: flyway: condition: service_completed_successfully`
+in docker-compose enforces that.
 """
 
 from __future__ import annotations
@@ -18,7 +18,13 @@ from sqlalchemy.orm import Session
 
 import crud
 from database import get_db
-from schemas import HealthResponse, TradeCreate, TradeRead, TradeUpdate
+from schemas import (
+    CounterpartyRead,
+    HealthResponse,
+    TradeCreate,
+    TradeRead,
+    TradeUpdate,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -28,10 +34,10 @@ logger = logging.getLogger("trading-api")
 
 app = FastAPI(
     title="Trading Service",
-    version="2.0.0",
+    version="3.0.0",
     description=(
-        "Teaching example (step 2 / V2): trades now carry status, fees, "
-        "counterparty, and updated_at."
+        "Teaching example (step 3 / V3): counterparties normalized into "
+        "their own table via the expand-contract pattern."
     ),
 )
 
@@ -133,3 +139,16 @@ def delete_trade_endpoint(
             detail=f"Trade {trade_id} not found",
         )
     return None
+
+
+@app.get(
+    "/counterparties",
+    response_model=List[CounterpartyRead],
+    tags=["counterparties"],
+)
+def list_counterparties_endpoint(
+    session: Session = Depends(get_db),
+) -> List[CounterpartyRead]:
+    """List all counterparties known to the trading service."""
+    counterparties = crud.list_counterparties(session)
+    return [CounterpartyRead.model_validate(cp) for cp in counterparties]

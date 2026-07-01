@@ -1,4 +1,4 @@
-"""Pydantic v2 request and response schemas for the trading API (V2)."""
+"""Pydantic v2 request and response schemas for the trading API (V3)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TradeSide = Literal["BUY", "SELL"]
 TradeStatus = Literal["PENDING", "SETTLED", "CANCELLED"]
+
+
+class CounterpartyRead(BaseModel):
+    """Response shape for GET /counterparties."""
+
+    id: int
+    name: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TradeBase(BaseModel):
@@ -35,11 +45,7 @@ class TradeCreate(TradeBase):
 
 
 class TradeUpdate(BaseModel):
-    """Payload accepted by PUT /trades/{id}.
-
-    Every field is optional so callers can PATCH-like update a single column
-    (for example, marking a trade SETTLED after clearing).
-    """
+    """Payload accepted by PUT /trades/{id}. Every field is optional."""
 
     symbol: Optional[str] = Field(default=None, min_length=1, max_length=16)
     side: Optional[TradeSide] = None
@@ -64,6 +70,7 @@ class TradeRead(TradeBase):
     status: TradeStatus
     fees: Decimal
     counterparty: Optional[str] = None
+    counterparty_id: Optional[int] = None
     executed_at: datetime
     updated_at: datetime
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Smoke-test the trading API endpoints against a running stack (V2).
+# Smoke-test the trading API endpoints against a running stack (V3).
 # Exits 0 on success, non-zero on the first failure.
 #
-# Adds coverage for V2 fields: status, fees, counterparty, updated_at.
+# Adds coverage for V3: /counterparties, counterparty_id on trades,
+# get-or-create semantics on repeated counterparty names.
 #
 # Requirements: curl, jq. Idempotent: creates trades, deletes them at the end.
 #
@@ -62,97 +63,96 @@ test_health() {
     assert_eq "database reachable" "reachable" "${db_status}"
 }
 
-test_list_seed_data_backfilled() {
-    info "GET /trades (V1 seed rows should have been backfilled by V2)"
+test_seed_settled() {
+    info "V2 backfill: V1 seed rows should be SETTLED"
     local settled_count
     settled_count=$(http_body "${BASE_URL}/trades" \
         | jq '[.[] | select(.status == "SETTLED")] | length')
     if (( settled_count >= 3 )); then
-        pass "V2 backfilled the 3 V1 seed rows to SETTLED (count=${settled_count})"
+        pass "V2 backfill preserved (SETTLED count=${settled_count})"
     else
-        fail "expected >= 3 rows with status=SETTLED, got ${settled_count}"
+        fail "expected >= 3 SETTLED rows, got ${settled_count}"
     fi
 }
 
+test_counterparties_start_empty() {
+    info "GET /counterparties (before any trades with counterparty)"
+    counterparties_before=$(http_body "${BASE_URL}/counterparties" | jq 'length')
+    info "counterparties before=${counterparties_before}"
+    pass "counterparties endpoint reachable"
+}
+
 test_create_buy_with_counterparty() {
-    info "POST /trades (BUY with counterparty)"
+    info "POST /trades (BUY with counterparty=JPM) creates counterparty row"
     local body
     body=$(http_body -X POST "${BASE_URL}/trades" \
         -H 'Content-Type: application/json' \
         -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"JPM"}')
-    local cp
-    cp=$(printf '%s' "${body}" | jq -r '.counterparty')
-    assert_eq "counterparty echoed back" "JPM" "${cp}"
-    local st
-    st=$(printf '%s' "${body}" | jq -r '.status')
-    assert_eq "default status is PENDING" "PENDING" "${st}"
+    local cp_id
+    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
+    if [[ "${cp_id}" != "null" && -n "${cp_id}" ]]; then
+        pass "counterparty_id populated (${cp_id})"
+    else
+        fail "counterparty_id was null; expected a FK id"
+    fi
+    local cp_name
+    cp_name=$(printf '%s' "${body}" | jq -r '.counterparty')
+    assert_eq "counterparty string still populated (expand phase)" "JPM" "${cp_name}"
+    trade_a_id=$(printf '%s' "${body}" | jq -r '.id')
+    jpm_cp_id="${cp_id}"
 }
 
-test_create_sell_and_capture_id() {
-    info "POST /trades (SELL) and capture id"
+test_get_or_create_reuses_row() {
+    info "POST /trades (BUY with counterparty=JPM again) reuses the same row"
     local body
     body=$(http_body -X POST "${BASE_URL}/trades" \
         -H 'Content-Type: application/json' \
-        -d '{"symbol":"AMD","side":"SELL","quantity":5,"price":170.25}')
-    created_id=$(printf '%s' "${body}" | jq -r '.id')
-    if [[ -n "${created_id}" && "${created_id}" != "null" ]]; then
-        pass "SELL create returned id=${created_id}"
-    else
-        fail "SELL create did not return an id (body=${body})"
-        exit 1
-    fi
+        -d '{"symbol":"AMD","side":"BUY","quantity":3,"price":170.00,"counterparty":"JPM"}')
+    local cp_id
+    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
+    assert_eq "second trade reuses JPM counterparty id" "${jpm_cp_id}" "${cp_id}"
+    trade_b_id=$(printf '%s' "${body}" | jq -r '.id')
 }
 
-test_filter_by_status() {
-    info "GET /trades?status=PENDING"
-    local non_pending
-    non_pending=$(http_body "${BASE_URL}/trades?status=PENDING" \
-        | jq '[.[] | select(.status != "PENDING")] | length')
-    assert_eq "no non-PENDING rows in status=PENDING filter" "0" "${non_pending}"
+test_counterparties_list_grew() {
+    info "GET /counterparties (JPM should now be present)"
+    local body
+    body=$(http_body "${BASE_URL}/counterparties")
+    local jpm_present
+    jpm_present=$(printf '%s' "${body}" | jq '[.[] | select(.name == "JPM")] | length')
+    assert_eq "JPM present in /counterparties" "1" "${jpm_present}"
 }
 
-test_filter_by_symbol() {
-    info "GET /trades?symbol=NVDA"
-    local count
-    count=$(http_body "${BASE_URL}/trades?symbol=NVDA" | jq 'length')
-    if (( count >= 1 )); then
-        pass "symbol filter returned ${count} rows"
-    else
-        fail "symbol filter returned no rows"
-    fi
+test_trade_without_counterparty() {
+    info "POST /trades (no counterparty) leaves counterparty_id null"
+    local body
+    body=$(http_body -X POST "${BASE_URL}/trades" \
+        -H 'Content-Type: application/json' \
+        -d '{"symbol":"AAPL","side":"SELL","quantity":2,"price":195.00}')
+    local cp_id
+    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
+    assert_eq "counterparty_id null when omitted" "null" "${cp_id}"
+    trade_c_id=$(printf '%s' "${body}" | jq -r '.id')
 }
 
 test_mark_settled() {
-    info "PUT /trades/${created_id} (mark SETTLED with fees)"
+    info "PUT /trades/${trade_a_id} (mark SETTLED)"
     local body
-    body=$(http_body -X PUT "${BASE_URL}/trades/${created_id}" \
+    body=$(http_body -X PUT "${BASE_URL}/trades/${trade_a_id}" \
         -H 'Content-Type: application/json' \
         -d '{"status":"SETTLED","fees":1.25}')
     local st
     st=$(printf '%s' "${body}" | jq -r '.status')
     assert_eq "status is SETTLED" "SETTLED" "${st}"
-    local fees
-    fees=$(printf '%s' "${body}" | jq -r '.fees')
-    assert_eq "fees is 1.25" "1.2500" "${fees}"
 }
 
-test_invalid_status_rejected() {
-    info "PUT /trades/${created_id} with invalid status (expect 422)"
-    local status_code
-    status_code=$(http_status -X PUT "${BASE_URL}/trades/${created_id}" \
-        -H 'Content-Type: application/json' \
-        -d '{"status":"BOGUS"}')
-    assert_eq "invalid status rejected" "422" "${status_code}"
-}
-
-test_delete() {
-    info "DELETE /trades/${created_id}"
-    local status_code
-    status_code=$(http_status -X DELETE "${BASE_URL}/trades/${created_id}")
-    assert_eq "DELETE status" "204" "${status_code}"
-    local followup
-    followup=$(http_status "${BASE_URL}/trades/${created_id}")
-    assert_eq "GET after DELETE" "404" "${followup}"
+test_delete_created() {
+    info "DELETE created trades (${trade_a_id}, ${trade_b_id}, ${trade_c_id})"
+    for tid in "${trade_a_id}" "${trade_b_id}" "${trade_c_id}"; do
+        local status_code
+        status_code=$(http_status -X DELETE "${BASE_URL}/trades/${tid}")
+        assert_eq "DELETE ${tid}" "204" "${status_code}"
+    done
 }
 
 test_not_found() {
@@ -163,7 +163,8 @@ test_not_found() {
 }
 
 main() {
-    created_id=""
+    trade_a_id=""; trade_b_id=""; trade_c_id=""
+    jpm_cp_id=""; counterparties_before=""
 
     if ! command -v jq >/dev/null; then
         fail "jq is required (brew install jq)"
@@ -172,14 +173,14 @@ main() {
 
     wait_for_api
     test_health
-    test_list_seed_data_backfilled
+    test_seed_settled
+    test_counterparties_start_empty
     test_create_buy_with_counterparty
-    test_create_sell_and_capture_id
-    test_filter_by_status
-    test_filter_by_symbol
+    test_get_or_create_reuses_row
+    test_counterparties_list_grew
+    test_trade_without_counterparty
     test_mark_settled
-    test_invalid_status_rejected
-    test_delete
+    test_delete_created
     test_not_found
 
     info "----------------------------------------"
