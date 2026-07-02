@@ -1,8 +1,8 @@
-"""Data-access helpers for the Trade and Counterparty resources (V3).
+"""Data-access helpers for the Trade resource.
 
-During the expand phase, `create_trade` writes to BOTH `trades.counterparty`
-(the old string column) AND `trades.counterparty_id` (the new FK). This
-keeps older readers working while new code can join through the FK.
+Post-V4 rollback of V3: writes and reads no longer touch a
+`counterparty_id` FK or a `counterparties` table. `counterparty` is a
+plain string column on `trades` again.
 """
 
 from __future__ import annotations
@@ -14,48 +14,14 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Counterparty, Trade
+from models import Trade
 from schemas import TradeCreate, TradeUpdate
 
 logger = logging.getLogger(__name__)
 
 
-def get_or_create_counterparty(session: Session, name: str) -> Counterparty:
-    """Return an existing counterparty or create a new one by name."""
-    normalized = name.strip()
-    existing = session.execute(
-        select(Counterparty).where(Counterparty.name == normalized)
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-    counterparty = Counterparty(name=normalized)
-    session.add(counterparty)
-    session.flush()
-    logger.info(
-        "Created counterparty id=%s name=%s", counterparty.id, counterparty.name
-    )
-    return counterparty
-
-
-def list_counterparties(session: Session) -> List[Counterparty]:
-    """Return all counterparties ordered by name."""
-    return list(
-        session.scalars(select(Counterparty).order_by(Counterparty.name)).all()
-    )
-
-
 def create_trade(session: Session, payload: TradeCreate) -> Trade:
-    """Insert a new trade and return the persisted row.
-
-    Writes both the legacy counterparty string and the normalized FK to keep
-    the expand-contract migration honest.
-    """
-    counterparty_id: Optional[int] = None
-    if payload.counterparty is not None and payload.counterparty.strip():
-        counterparty_id = get_or_create_counterparty(
-            session, payload.counterparty
-        ).id
-
+    """Insert a new trade and return the persisted row."""
     trade = Trade(
         symbol=payload.symbol,
         side=payload.side,
@@ -64,18 +30,17 @@ def create_trade(session: Session, payload: TradeCreate) -> Trade:
         status=payload.status,
         fees=payload.fees,
         counterparty=payload.counterparty,
-        counterparty_id=counterparty_id,
         updated_at=datetime.now(tz=timezone.utc),
     )
     session.add(trade)
     session.commit()
     session.refresh(trade)
     logger.info(
-        "Created trade id=%s symbol=%s side=%s counterparty_id=%s",
+        "Created trade id=%s symbol=%s side=%s status=%s",
         trade.id,
         trade.symbol,
         trade.side,
-        trade.counterparty_id,
+        trade.status,
     )
     return trade
 
@@ -109,28 +74,12 @@ def list_trades(
 def update_trade(
     session: Session, trade_id: int, payload: TradeUpdate
 ) -> Optional[Trade]:
-    """Apply a partial update to a trade. Returns None if not found.
-
-    If `counterparty` is updated, `counterparty_id` is also resolved and set.
-    """
+    """Apply a partial update to a trade. Returns None if not found."""
     trade = session.get(Trade, trade_id)
     if trade is None:
         return None
 
     updates = payload.model_dump(exclude_unset=True)
-
-    # Resolve counterparty_id from the string first (get-or-create), then
-    # apply the rest of the payload. The setattr loop below writes the
-    # string column but does not touch counterparty_id (it is not in the
-    # payload), so the order is safe. Doing the FK resolution first also
-    # means a bad counterparty raises before we mutate anything else.
-    if "counterparty" in updates:
-        cp_name = updates["counterparty"]
-        if cp_name is None or not cp_name.strip():
-            trade.counterparty_id = None
-        else:
-            trade.counterparty_id = get_or_create_counterparty(session, cp_name).id
-
     for field, value in updates.items():
         setattr(trade, field, value)
     trade.updated_at = datetime.now(tz=timezone.utc)

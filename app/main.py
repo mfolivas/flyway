@@ -1,8 +1,13 @@
-"""FastAPI entrypoint for the trading service (V3).
+"""FastAPI entrypoint for the trading service (post V4 rollback).
 
-The service assumes Flyway has already applied V1, V2, and V3 before the
-API process starts. `depends_on: flyway: condition: service_completed_successfully`
-in docker-compose enforces that.
+The service assumes Flyway has applied V1, V2, V3, and V4 before this
+process starts. V4 reversed V3 in the database: the counterparties table
+and trades.counterparty_id are gone, so this app code no longer exposes
+/counterparties and no longer writes an FK. `counterparty` is back to
+being a plain string on the trade payload.
+
+The `depends_on: flyway: condition: service_completed_successfully` line
+in docker-compose enforces the migration ordering.
 """
 
 from __future__ import annotations
@@ -18,13 +23,7 @@ from sqlalchemy.orm import Session
 
 import crud
 from database import get_db
-from schemas import (
-    CounterpartyRead,
-    HealthResponse,
-    TradeCreate,
-    TradeRead,
-    TradeUpdate,
-)
+from schemas import HealthResponse, TradeCreate, TradeRead, TradeUpdate
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -34,10 +33,10 @@ logger = logging.getLogger("trading-api")
 
 app = FastAPI(
     title="Trading Service",
-    version="3.0.0",
+    version="4.0.0",
     description=(
-        "Teaching example (step 3 / V3): counterparties normalized into "
-        "their own table via the expand-contract pattern."
+        "Teaching example (step 4 / V4): forward-only rollback of V3. "
+        "counterparties table dropped; counterparty is a plain string again."
     ),
 )
 
@@ -140,16 +139,3 @@ def delete_trade_endpoint(
             detail=f"Trade {trade_id} not found",
         )
     return None
-
-
-@app.get(
-    "/counterparties",
-    response_model=List[CounterpartyRead],
-    tags=["counterparties"],
-)
-def list_counterparties_endpoint(
-    session: Session = Depends(get_db),
-) -> List[CounterpartyRead]:
-    """List all counterparties known to the trading service."""
-    counterparties = crud.list_counterparties(session)
-    return [CounterpartyRead.model_validate(cp) for cp in counterparties]

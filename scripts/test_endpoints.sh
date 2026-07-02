@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Smoke-test the trading API endpoints against a running stack (V3).
+# Smoke-test the trading API endpoints against a running stack (V4).
 # Exits 0 on success, non-zero on the first failure.
 #
-# Adds coverage for V3: /counterparties, counterparty_id on trades,
-# get-or-create semantics on repeated counterparty names.
+# V4 is a forward-only rollback of V3. Compared to step-3, this script:
+#   - asserts /counterparties is gone (404, not reachable)
+#   - asserts trade responses no longer expose counterparty_id
+#   - keeps V2 coverage (status/fees/counterparty string, SETTLED backfill)
 #
 # Requirements: curl, jq. Idempotent: creates trades, deletes them at the end.
 #
@@ -64,79 +66,53 @@ test_health() {
 }
 
 test_seed_settled() {
-    info "V2 backfill: V1 seed rows should be SETTLED"
+    info "V2 backfill preserved: V1 seed rows should still be SETTLED"
     local settled_count
     settled_count=$(http_body "${BASE_URL}/trades" \
         | jq '[.[] | select(.status == "SETTLED")] | length')
     if (( settled_count >= 3 )); then
-        pass "V2 backfill preserved (SETTLED count=${settled_count})"
+        pass "V2 backfill preserved after V4 rollback (SETTLED count=${settled_count})"
     else
         fail "expected >= 3 SETTLED rows, got ${settled_count}"
     fi
 }
 
-test_counterparties_start_empty() {
-    info "GET /counterparties (before any trades with counterparty)"
-    counterparties_before=$(http_body "${BASE_URL}/counterparties" | jq 'length')
-    info "counterparties before=${counterparties_before}"
-    pass "counterparties endpoint reachable"
+test_counterparties_endpoint_gone() {
+    info "GET /counterparties should be gone after V4 rollback"
+    local status_code
+    status_code=$(http_status "${BASE_URL}/counterparties")
+    assert_eq "/counterparties returns 404" "404" "${status_code}"
 }
 
-test_create_buy_with_counterparty() {
-    info "POST /trades (BUY with counterparty=JPM) creates counterparty row"
+test_create_with_counterparty_string() {
+    info "POST /trades with counterparty=JPM writes the string only"
     local body
     body=$(http_body -X POST "${BASE_URL}/trades" \
         -H 'Content-Type: application/json' \
         -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"JPM"}')
-    local cp_id
-    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
-    if [[ "${cp_id}" != "null" && -n "${cp_id}" ]]; then
-        pass "counterparty_id populated (${cp_id})"
-    else
-        fail "counterparty_id was null; expected a FK id"
-    fi
     local cp_name
     cp_name=$(printf '%s' "${body}" | jq -r '.counterparty')
-    assert_eq "counterparty string still populated (expand phase)" "JPM" "${cp_name}"
+    assert_eq "counterparty string echoed back" "JPM" "${cp_name}"
+    local cp_id_present
+    cp_id_present=$(printf '%s' "${body}" | jq 'has("counterparty_id")')
+    assert_eq "counterparty_id absent from response" "false" "${cp_id_present}"
     trade_a_id=$(printf '%s' "${body}" | jq -r '.id')
-    jpm_cp_id="${cp_id}"
 }
 
-test_get_or_create_reuses_row() {
-    info "POST /trades (BUY with counterparty=JPM again) reuses the same row"
-    local body
-    body=$(http_body -X POST "${BASE_URL}/trades" \
-        -H 'Content-Type: application/json' \
-        -d '{"symbol":"AMD","side":"BUY","quantity":3,"price":170.00,"counterparty":"JPM"}')
-    local cp_id
-    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
-    assert_eq "second trade reuses JPM counterparty id" "${jpm_cp_id}" "${cp_id}"
-    trade_b_id=$(printf '%s' "${body}" | jq -r '.id')
-}
-
-test_counterparties_list_grew() {
-    info "GET /counterparties (JPM should now be present)"
-    local body
-    body=$(http_body "${BASE_URL}/counterparties")
-    local jpm_present
-    jpm_present=$(printf '%s' "${body}" | jq '[.[] | select(.name == "JPM")] | length')
-    assert_eq "JPM present in /counterparties" "1" "${jpm_present}"
-}
-
-test_trade_without_counterparty() {
-    info "POST /trades (no counterparty) leaves counterparty_id null"
+test_create_without_counterparty() {
+    info "POST /trades without counterparty succeeds"
     local body
     body=$(http_body -X POST "${BASE_URL}/trades" \
         -H 'Content-Type: application/json' \
         -d '{"symbol":"AAPL","side":"SELL","quantity":2,"price":195.00}')
-    local cp_id
-    cp_id=$(printf '%s' "${body}" | jq -r '.counterparty_id')
-    assert_eq "counterparty_id null when omitted" "null" "${cp_id}"
-    trade_c_id=$(printf '%s' "${body}" | jq -r '.id')
+    local cp_name
+    cp_name=$(printf '%s' "${body}" | jq -r '.counterparty')
+    assert_eq "counterparty null when omitted" "null" "${cp_name}"
+    trade_b_id=$(printf '%s' "${body}" | jq -r '.id')
 }
 
 test_mark_settled() {
-    info "PUT /trades/${trade_a_id} (mark SETTLED)"
+    info "PUT /trades/${trade_a_id} (mark SETTLED with fees)"
     local body
     body=$(http_body -X PUT "${BASE_URL}/trades/${trade_a_id}" \
         -H 'Content-Type: application/json' \
@@ -147,8 +123,8 @@ test_mark_settled() {
 }
 
 test_delete_created() {
-    info "DELETE created trades (${trade_a_id}, ${trade_b_id}, ${trade_c_id})"
-    for tid in "${trade_a_id}" "${trade_b_id}" "${trade_c_id}"; do
+    info "DELETE created trades (${trade_a_id}, ${trade_b_id})"
+    for tid in "${trade_a_id}" "${trade_b_id}"; do
         local status_code
         status_code=$(http_status -X DELETE "${BASE_URL}/trades/${tid}")
         assert_eq "DELETE ${tid}" "204" "${status_code}"
@@ -163,8 +139,7 @@ test_not_found() {
 }
 
 main() {
-    trade_a_id=""; trade_b_id=""; trade_c_id=""
-    jpm_cp_id=""; counterparties_before=""
+    trade_a_id=""; trade_b_id=""
 
     if ! command -v jq >/dev/null; then
         fail "jq is required (brew install jq)"
@@ -174,11 +149,9 @@ main() {
     wait_for_api
     test_health
     test_seed_settled
-    test_counterparties_start_empty
-    test_create_buy_with_counterparty
-    test_get_or_create_reuses_row
-    test_counterparties_list_grew
-    test_trade_without_counterparty
+    test_counterparties_endpoint_gone
+    test_create_with_counterparty_string
+    test_create_without_counterparty
     test_mark_settled
     test_delete_created
     test_not_found

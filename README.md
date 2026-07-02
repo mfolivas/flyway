@@ -1,77 +1,118 @@
-# Step 3 — V3: normalize counterparties (expand-contract)
+# Step 4 — V4: forward-only rollback of V3
 
-You are on branch **`step-3-add-v3`**. This stage extracts the
-`counterparty` free-text column into its own `counterparties` table with a
-proper foreign key, using the **expand-contract pattern** so no running
-consumer breaks.
+You are on branch **`step-4-rollback-v3`**. This stage teaches how to
+reverse an applied migration in Flyway Community: you ship a **new
+higher-numbered migration** that inverses the effect. There is no
+`flyway rollback` command in the Community edition — this pattern is
+the sanctioned answer.
 
 **What this teaches:**
-1. Expand-contract for zero-downtime schema changes:
-   - **Expand (this migration):** add the new structure, backfill, keep
-     the old column in place so old code still works.
-   - **Deploy code** that writes to both and reads from the new structure.
-   - **Contract (a future V4):** drop the old column once no code touches
-     it.
-2. Backfill logic inside a migration: `INSERT ... SELECT DISTINCT` plus a
-   correlated `UPDATE ... FROM`.
-3. Get-or-create semantics in the application layer so repeated
-   counterparty names collapse to a single row.
+1. **Forward-only rollback.** V3 shipped counterparty normalization. We
+   decided that was the wrong call. V4 drops the FK column, drops the
+   `counterparties` table, and keeps the pre-V3 string column intact.
+2. **Never edit or delete an applied V file.** Flyway's checksum
+   enforcement would refuse to run against any environment where V3
+   already succeeded. The only safe move is a new V file.
+3. **Coordinated schema + code rollback.** The migration is one half of
+   the story — the app code that referenced `counterparty_id` and
+   `/counterparties` also has to be walked back to the pre-V3 shape.
+4. **When `flyway repair` is the right tool** (a *different* scenario)
+   and why `U__` undo migrations are not part of Flyway Community.
 
 Compare against the previous stage:
 
 ```bash
-git diff step-2-add-v2 step-3-add-v3 -- db/ app/
+git diff step-3-add-v3 step-4-rollback-v3 -- db/ app/
 ```
 
 ---
 
-## What V3 changes
+## What V4 changes
 
 ```sql
-CREATE TABLE counterparties (
-    id         BIGSERIAL PRIMARY KEY,
-    name       VARCHAR(64) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_counterparties_name UNIQUE (name)
-);
-
-INSERT INTO counterparties (name)
-SELECT DISTINCT counterparty
-FROM trades
-WHERE counterparty IS NOT NULL
-ON CONFLICT (name) DO NOTHING;
+DROP INDEX IF EXISTS ix_trades_counterparty_id;
 
 ALTER TABLE trades
-    ADD COLUMN IF NOT EXISTS counterparty_id BIGINT
-    REFERENCES counterparties (id);
+    DROP COLUMN IF EXISTS counterparty_id;
 
-UPDATE trades t
-   SET counterparty_id = c.id
-  FROM counterparties c
- WHERE t.counterparty = c.name
-   AND t.counterparty_id IS NULL;
-
-CREATE INDEX IF NOT EXISTS ix_trades_counterparty_id ON trades (counterparty_id);
+DROP TABLE IF EXISTS counterparties;
 ```
 
-**Note the old `trades.counterparty` column is intentionally preserved.**
-A hypothetical `V4__drop_trades_counterparty_column.sql` would remove it
-once every consumer reads from `counterparty_id`.
+Three statements, executed in reverse dependency order:
+1. Drop the index first (has to go before the column it covers).
+2. Drop the FK column (has to go before the table it references).
+3. Drop the `counterparties` table.
 
-Application code changes:
+`trades.counterparty` — the original V2 string column — stays untouched.
+That is why V3 was pedagogically designed as the **expand** half of
+expand-contract: the old column was preserved, so V4 can walk V3 back
+without losing any data that was only in the FK.
 
-- New ORM model: `Counterparty`.
-- `Trade.counterparty_id` FK with a lazy relationship.
-- `create_trade` writes BOTH the old string column AND the FK.
-- New endpoint: `GET /counterparties`.
-- `TradeRead` response now includes `counterparty_id`.
+Application code changes on this branch:
 
-> **Note:** the backfill sets `updated_at = executed_at` on V1 rows, but
-> new inserts get `updated_at = NOW()` (via the column default and the
-> `crud.create_trade` helper). Legacy rows therefore have
-> `updated_at == executed_at`, while new rows track "last modified"
-> independently. That asymmetry is intentional — we don't want to
-> pretend V1 rows were modified at migration time.
+- `models.py` — no `Counterparty` model, no `counterparty_id` FK.
+- `schemas.py` — no `CounterpartyRead`, no `counterparty_id` on
+  `TradeRead`.
+- `crud.py` — no `get_or_create_counterparty`, no dual-writes.
+  `create_trade` writes only the string column, like it did in V2.
+- `main.py` — no `GET /counterparties` endpoint. `version = "4.0.0"`.
+
+## Why not just delete `V3__extract_counterparty_table.sql`?
+
+Two reasons, both hard blockers:
+
+1. **Checksum enforcement.** On any environment where V3 already ran,
+   Flyway records its checksum in `flyway_schema_history`. On the next
+   startup Flyway recomputes the checksum from disk and compares — if
+   the file is gone, or its content differs, Flyway refuses to run. You
+   cannot silently rewrite history.
+2. **Fresh environments must traverse the same history.** A new dev laptop
+   needs to reach the same schema as prod. If you deleted V3, fresh envs
+   would skip it, but prod already has it. History would fork. Flyway is
+   built to prevent exactly that.
+
+The one-word summary: **the schema history is a ledger, not a scratchpad**.
+
+## The three related things people confuse
+
+### 1. Forward-only rollback (this migration, V4)
+
+Used when an applied migration was **successful** but you don't want
+its effect anymore. Ship an inverse migration. Same pipeline, same
+review process, same gates as any other change.
+
+### 2. `flyway repair`
+
+Used when an applied migration **failed** mid-run and left a
+`success = false` row in `flyway_schema_history`, or when someone
+edited an already-applied V file and you want Flyway to accept the new
+checksum (rare, only after a review). `repair` clears failed rows and
+recomputes checksums. It does NOT reverse a successful migration.
+Different tool, different problem.
+
+### 3. Flyway Teams `U__` undo migrations
+
+Flyway Teams (paid) supports `U{N}__.sql` files that mirror
+`V{N}__.sql`. `flyway undo` runs the U file, reverses the effect, and
+removes the row from `flyway_schema_history`. We do NOT use this in
+Community. If we ever did, ADR-001 would need an update — right now the
+platform standard is Community + forward-only + expand-contract.
+
+## Real-world rollback priorities
+
+When a schema change goes wrong in production, ops teams reach for
+these in order:
+
+1. **Fix-forward** with a new migration (safest, audit trail intact).
+   This is the pattern V4 demonstrates.
+2. **Point-in-time recovery** from Postgres WAL backups (used when data
+   was corrupted, not just schema). Loses writes after the recovery
+   point.
+3. **Restore from snapshot** (last resort — loses everything after the
+   snapshot).
+
+The whole point of Flyway + expand-contract is to keep fix-forward
+viable so you almost never need levels 2 or 3.
 
 ---
 
@@ -83,9 +124,9 @@ Application code changes:
 > migration files exactly — a clean volume avoids any drift confusion.
 
 ```bash
-cd ~/Documents/analysis/stories/database-migration/example
-cp .env.example .env         # if you haven't already
-docker compose build         # rebuild the API image for V3 code
+cd flyway            # wherever you cloned this repo
+cp .env.example .env # if you haven't already
+docker compose build # rebuild the API image for V4 code
 ```
 
 ## How to start
@@ -101,8 +142,13 @@ docker compose logs -f api
 On success Flyway logs show:
 
 ```text
-Successfully applied 3 migrations to schema "public"
+Successfully applied 4 migrations to schema "public"
 ```
+
+Fresh environments apply V1 → V2 → V3 → V4 in order. V3 briefly
+materialises the `counterparties` table; V4 immediately drops it. That
+is the correct behavior — the ledger records what actually happened, in
+order, on every environment.
 
 ## How to test
 
@@ -110,34 +156,14 @@ Successfully applied 3 migrations to schema "public"
 bash scripts/test_endpoints.sh
 ```
 
-The V3 test script verifies:
+The V4 test script verifies:
 
-- `GET /counterparties` is reachable and returns a list.
-- Posting a trade with `counterparty="JPM"` creates a `counterparties`
-  row and populates `trades.counterparty_id`.
-- A second trade with the same counterparty **reuses** the existing row
-  (no duplicate).
-- Trades without a counterparty leave `counterparty_id` null.
-
-Manual examples:
-
-```bash
-# Fresh DB: no counterparties yet
-curl -s http://localhost:8000/counterparties | jq .
-
-# Post a trade with a counterparty
-curl -s -X POST http://localhost:8000/trades \
-  -H 'Content-Type: application/json' \
-  -d '{"symbol":"NVDA","side":"BUY","quantity":10,"price":950.50,"counterparty":"Goldman"}' | jq .
-
-# Counterparties list now contains Goldman
-curl -s http://localhost:8000/counterparties | jq .
-
-# Second trade with the same counterparty reuses the row
-curl -s -X POST http://localhost:8000/trades \
-  -H 'Content-Type: application/json' \
-  -d '{"symbol":"AMD","side":"SELL","quantity":5,"price":170.25,"counterparty":"Goldman"}' | jq .
-```
+- `GET /counterparties` returns **404** (endpoint gone).
+- Trade responses no longer include a `counterparty_id` field.
+- Posting a trade with `counterparty="JPM"` still writes the string
+  column and echoes it back.
+- V1 seed rows are still `SETTLED` (V2 backfill preserved through the
+  V4 rollback — as it should be, since V4 didn't touch V2's columns).
 
 ## How to inspect Flyway state
 
@@ -150,86 +176,80 @@ docker compose exec postgres psql -U trading_user -d trading \
 Expected:
 
 ```text
- installed_rank | version | description                | success
-----------------+---------+----------------------------+---------
-              1 | 1       | initial trading schema     | t
-              2 | 2       | enhance trading table      | t
-              3 | 3       | extract counterparty table | t
+ installed_rank | version | description                        | success
+----------------+---------+------------------------------------+---------
+              1 | 1       | initial trading schema             | t
+              2 | 2       | enhance trading table              | t
+              3 | 3       | extract counterparty table         | t
+              4 | 4       | revert v3 counterparty extraction  | t
 ```
 
-Inspect the joined data:
+Confirm the counterparties table is gone:
 
 ```bash
-docker compose exec postgres psql -U trading_user -d trading -c '
-    SELECT t.id, t.symbol, t.side, t.counterparty, c.name AS cp_name, c.id AS cp_id
-      FROM trades t
-      LEFT JOIN counterparties c ON c.id = t.counterparty_id
-     ORDER BY t.id;'
+docker compose exec postgres psql -U trading_user -d trading \
+  -c "SELECT to_regclass('public.counterparties');"
+# Expected: NULL
 ```
 
-## Exercise — trigger and repair checksum drift
-
-Flyway's checksum enforcement is the guardrail against "someone edited a
-migration after it ran." Try breaking it on purpose:
+And that `trades.counterparty_id` is gone:
 
 ```bash
-# Bring the stack up and let all three migrations apply.
+docker compose exec postgres psql -U trading_user -d trading -c '\d trades'
+# Expected: no counterparty_id column
+```
+
+## Exercise — check what a fresh dev laptop sees
+
+Simulating a brand-new environment:
+
+```bash
+docker compose down -v
 docker compose up -d
-docker compose run --rm flyway info    # Success on V1, V2, V3.
-
-# Edit V1 in a harmless way (add a blank line at the end).
-printf '\n' >> db/migrations/V1__initial_trading_schema.sql
-
-# Re-run migrate. Flyway refuses.
-docker compose run --rm flyway migrate
-#   ERROR: Migration checksum mismatch for migration version 1
-#   -> Applied to database : ...
-#   -> Resolved locally    : ...
-
-# You have two ways out. Pick one:
-
-# (a) Revert the edit and try again.
-git checkout -- db/migrations/V1__initial_trading_schema.sql
-docker compose run --rm flyway migrate    # succeeds.
-
-# (b) If the edit was intentional (e.g. a comment cleanup), tell Flyway
-#     to accept the new checksum:
-docker compose run --rm flyway repair
-docker compose run --rm flyway info       # V1 shows the updated checksum.
+docker compose logs flyway | grep 'Migrating\|Successfully'
 ```
 
-Never resolve drift by hand-editing `flyway_schema_history`. `repair` is
-the sanctioned tool.
+You should see all four migrations apply, in order, ending with:
+
+```text
+Successfully applied 4 migrations to schema "public", now at version v4
+```
+
+The V3 changes appear briefly during migration and are gone by the time
+Flyway exits. The final state matches what production sees.
 
 ## Where to go from here
 
-You have finished the workshop.
+You have completed the workshop.
 
 - Review the full arc:
-  `git diff main step-3-add-v3 -- db/ app/`
-- Read [`docs/migration-strategy.md`](docs/migration-strategy.md) for the
-  full write-up on Flyway state, checksum drift, failure handling, and
-  the expand-contract pattern.
+  `git diff main step-4-rollback-v3 -- db/ app/`
+- Read [`docs/migration-strategy.md`](docs/migration-strategy.md) for
+  the full write-up on Flyway state, checksum drift, failure handling,
+  and the expand-contract pattern.
 - Read [`docs/decisions/ADR-001-adopt-flyway.md`](docs/decisions/ADR-001-adopt-flyway.md)
-  for the rationale behind choosing Flyway over Liquibase, Alembic, and
-  Sqitch.
-- Try adding a `V4__drop_trades_counterparty_column.sql` yourself as an
-  exercise. Remember: forward-only. If you break it, `flyway repair`
-  clears the failed row from history.
+  for the rationale behind choosing Flyway over Liquibase, Alembic,
+  and Sqitch.
+- Try adding a `V5__…sql` yourself. Some options:
+  - Add a real feature (e.g. an `executions` table for partial fills).
+  - Re-introduce counterparties, this time with a plan for the contract
+    half.
+  - Add a `R__refresh_reporting_views.sql` repeatable migration and
+    observe how it re-runs whenever the file changes.
 
 ## Troubleshooting
 
-**`FOREIGN KEY constraint violated on counterparty_id`**
-Something wrote to `trades.counterparty_id` with an id that does not
-exist in `counterparties`. In this example that should not happen — the
-app resolves counterparties through `get_or_create_counterparty`. Check
-`crud.py` for a recent edit that bypassed it.
-
-**Duplicate counterparty rows appearing**
-The `uq_counterparties_name` constraint would prevent that at the DB
-layer. If they appear, the application code path is bypassing
-`get_or_create_counterparty` — inspect `crud.py`.
-
 **`Migration checksum mismatch`**
-Someone edited `V1__`, `V2__`, or `V3__` after it was applied. Revert or
-`docker compose run --rm flyway repair`.
+Someone edited `V1`, `V2`, `V3`, or `V4` after it was applied. Revert
+the edit or run `docker compose run --rm flyway repair` if the edit was
+intentional.
+
+**`relation "counterparties" does not exist` in application logs**
+The app code was reverted to the V2 shape and does not reference
+`counterparties` any more. If you see this error you are running older
+V3 code against the V4 schema — rebuild the API image with
+`docker compose build --no-cache api`.
+
+**`Successfully applied 0 migrations`**
+Your Postgres volume still has the V1–V3 state from step-3 without V4.
+Run `docker compose down -v` and re-`docker compose up`.

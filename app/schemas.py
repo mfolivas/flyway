@@ -1,4 +1,8 @@
-"""Pydantic v2 request and response schemas for the trading API (V3)."""
+"""Pydantic v2 request and response schemas for the trading API.
+
+Post-V4 rollback of V3: the /counterparties endpoint and the
+`counterparty_id` FK are gone. `counterparty` is a plain string again.
+"""
 
 from __future__ import annotations
 
@@ -10,16 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TradeSide = Literal["BUY", "SELL"]
 TradeStatus = Literal["PENDING", "SETTLED", "CANCELLED"]
-
-
-class CounterpartyRead(BaseModel):
-    """Response shape for GET /counterparties."""
-
-    id: int
-    name: str
-    created_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
 
 
 class TradeBase(BaseModel):
@@ -70,7 +64,6 @@ class TradeRead(TradeBase):
     status: TradeStatus
     fees: Decimal
     counterparty: Optional[str] = None
-    counterparty_id: Optional[int] = None
     executed_at: datetime
     updated_at: datetime
 
